@@ -123,55 +123,124 @@ class GaussianSphereRepresentation:
 
     def optimize_gaussians(self, target_image, iterations=100):
         """
-        完整的优化流程（修复NaN问题版本）
+        改进的优化流程，包含学习率调度和梯度累积
         """
         # 准备目标图像
         h, w = self.original_resolution
         target_tensor = torch.tensor(cv2.resize(target_image, (w, h)) / 255.0, 
                                    dtype=torch.float32).to(self.device)
         
-        # 调整优化器参数（降低学习率，添加梯度裁剪）
+        # 使用更复杂的学习率策略
         optimizer = torch.optim.Adam([
-            {'params': self.gaussian_params['positions'], 'lr': 0.0001},  # 降低10倍
-            {'params': self.gaussian_params['colors'], 'lr': 0.005},
-            {'params': self.gaussian_params['opacities'], 'lr': 0.01},
-            {'params': self.gaussian_params['scales'], 'lr': 0.001},
-            {'params': self.gaussian_params['rotations'], 'lr': 0.0001}
+            {'params': self.gaussian_params['positions'], 'lr': 0.0005},  # 略微提高
+            {'params': self.gaussian_params['colors'], 'lr': 0.01},
+            {'params': self.gaussian_params['opacities'], 'lr': 0.02},
+            {'params': self.gaussian_params['scales'], 'lr': 0.002},
+            {'params': self.gaussian_params['rotations'], 'lr': 0.0005}
         ])
         
-        # 混合损失权重
-        loss_weights = {'l1': 0.8, 'ssim': 0.2}
+        # 添加学习率调度器 - 余弦退火重启
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=50, T_mult=2, eta_min=1e-6
+        )
+        
+        # 动态权重混合损失
+        loss_weights = {'l1': 0.8, 'ssim': 0.2, 'perceptual': 0.1}  # 添加感知损失权重
+        
+        # 梯度累积步数 - 可提高内存效率
+        accumulation_steps = 2
+        
+        # 随机扰动步长 - 帮助跳出局部最小值
+        perturbation_step = 30
+        perturbation_scale = 0.01
         
         best_loss = float('inf')
+        patience_counter = 0
+        patience_threshold = 20  # 早停耐心值
+        
+        # 启用混合精度训练
+        scaler = torch.cuda.amp.GradScaler()
+        
+        # 释放并预留GPU内存
+        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.9)  # 增加到90%
+        
         for i in range(iterations):
             optimizer.zero_grad()
             
-            # 添加渲染保护机制
-            with torch.autograd.detect_anomaly():
+            # 随机扰动参数以跳出局部最小值
+            if i > 0 and i % perturbation_step == 0:
+                with torch.no_grad():
+                    # 对位置和缩放参数添加随机扰动
+                    self.gaussian_params['positions'].data += torch.randn_like(
+                        self.gaussian_params['positions']) * perturbation_scale * (1.0 - i/iterations)
+                    self.gaussian_params['scales'].data *= (1.0 + torch.randn_like(
+                        self.gaussian_params['scales']) * perturbation_scale * (1.0 - i/iterations))
+            
+            # 混合精度训练
+            with torch.cuda.amp.autocast():
                 rendered_tensor = self.render_tensor()
                 
                 # 计算混合损失
                 l1_loss = torch.nn.L1Loss()(rendered_tensor, target_tensor)
                 ssim_loss = self._ssim_loss(rendered_tensor, target_tensor)
-                total_loss = loss_weights['l1']*l1_loss + loss_weights['ssim']*ssim_loss
                 
-                # 添加正则化项防止数值爆炸
-                reg_loss = torch.mean(torch.abs(self.gaussian_params['positions'])) * 0.01
+                # 添加额外的感知损失项 - 使用梯度图作为简单的感知特征
+                sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).to(self.device).view(1, 1, 3, 3)
+                sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).to(self.device).view(1, 1, 3, 3)
+                
+                # 转为灰度并计算梯度
+                gray_rendered = 0.299 * rendered_tensor[...,0] + 0.587 * rendered_tensor[...,1] + 0.114 * rendered_tensor[...,2]
+                gray_target = 0.299 * target_tensor[...,0] + 0.587 * target_tensor[...,1] + 0.114 * target_tensor[...,2]
+                
+                gray_rendered = gray_rendered.unsqueeze(0).unsqueeze(0)
+                gray_target = gray_target.unsqueeze(0).unsqueeze(0)
+                
+                grad_x_rendered = torch.nn.functional.conv2d(gray_rendered, sobel_x, padding=1)
+                grad_y_rendered = torch.nn.functional.conv2d(gray_rendered, sobel_y, padding=1)
+                grad_x_target = torch.nn.functional.conv2d(gray_target, sobel_x, padding=1)
+                grad_y_target = torch.nn.functional.conv2d(gray_target, sobel_y, padding=1)
+                
+                perceptual_loss = torch.nn.functional.mse_loss(grad_x_rendered, grad_x_target) + \
+                                 torch.nn.functional.mse_loss(grad_y_rendered, grad_y_target)
+                
+                # 权重衰减 - 随着训练的进行，提高SSIM和感知损失的权重
+                progress = i / iterations
+                l1_weight = loss_weights['l1'] * (1.0 - progress*0.3)  # 逐渐降低L1权重
+                ssim_weight = loss_weights['ssim'] * (1.0 + progress)  # 逐渐提高SSIM权重
+                perceptual_weight = loss_weights['perceptual'] * (1.0 + progress*2.0)  # 逐渐提高感知损失权重
+                
+                total_loss = l1_weight*l1_loss + ssim_weight*ssim_loss + perceptual_weight*perceptual_loss
+                
+                # 添加可变正则化项 - 随训练进行减小
+                reg_coef = 0.01 * (1.0 - progress)
+                reg_loss = torch.mean(torch.abs(self.gaussian_params['positions'])) * reg_coef
                 total_loss += reg_loss
-
-                # 反向传播和优化（添加梯度裁剪）
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.gaussian_params['positions'], 1.0)
-                torch.nn.utils.clip_grad_norm_(self.gaussian_params['scales'], 0.1)
-                optimizer.step()
+                
+                # 梯度累积
+                total_loss = total_loss / accumulation_steps
+            
+            # 使用混合精度训练的反向传播
+            scaler.scale(total_loss).backward()
+            
+            if (i + 1) % accumulation_steps == 0:
+                # 梯度裁剪 - 动态裁剪阈值
+                clip_value = 1.0 * (1.0 - progress*0.5)  # 随着训练进行，适当降低裁剪阈值
+                torch.nn.utils.clip_grad_norm_(self.gaussian_params['positions'], clip_value)
+                torch.nn.utils.clip_grad_norm_(self.gaussian_params['scales'], clip_value*0.1)
+                
+                # 更新参数
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
             
             # 参数约束（添加更严格的限制）
             with torch.no_grad():
-                self.gaussian_params['opacities'].data = self.gaussian_params['opacities'].clamp(0.1, 0.9)
-                self.gaussian_params['colors'].data = self.gaussian_params['colors'].clamp(0.1, 0.9)
-                self.gaussian_params['scales'].data = self.gaussian_params['scales'].clamp(0.05, 0.3)
+                self.gaussian_params['opacities'].data = self.gaussian_params['opacities'].clamp(0.1, 0.95)
+                self.gaussian_params['colors'].data = self.gaussian_params['colors'].clamp(0.05, 0.95)
+                self.gaussian_params['scales'].data = self.gaussian_params['scales'].clamp(0.03, 0.4)
                 # 防止位置参数爆炸
-                self.gaussian_params['positions'].data = self.gaussian_params['positions'].clamp(-3, 3)
+                self.gaussian_params['positions'].data = self.gaussian_params['positions'].clamp(-3.5, 3.5)
             
             # 检查NaN并提前终止
             if torch.isnan(total_loss):
@@ -179,30 +248,48 @@ class GaussianSphereRepresentation:
                 break
             
             # 保存最佳参数
-            if total_loss < best_loss:
-                best_loss = total_loss
+            if total_loss * accumulation_steps < best_loss:
+                best_loss = total_loss * accumulation_steps
                 best_params = {k: v.clone() for k,v in self.gaussian_params.items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
             
-            print(f"Iter {i+1}/{iterations} Loss: {total_loss.item():.4f} "
-                 f"(L1: {l1_loss.item():.4f}, SSIM: {ssim_loss.item():.4f})")
+            # 早停策略
+            if patience_counter > patience_threshold:
+                print(f"损失值停滞不前达{patience_threshold}次，应用早停策略")
+                
+                # 学习率重启并减小扰动
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = param_group['lr'] * 0.5
+                
+                # 重置耐心计数器
+                patience_counter = 0
+                
+                # 如果学习率已经很低，则终止优化
+                if optimizer.param_groups[0]['lr'] < 1e-6:
+                    print("学习率过低，终止优化")
+                    break
+            
+            # 可视化训练进度
+            if (i+1) % 2 == 0:
+                print(f"Iter {i+1}/{iterations} Loss: {(total_loss * accumulation_steps).item():.6f} "
+                     f"(L1: {l1_loss.item():.4f}, SSIM: {ssim_loss.item():.4f}, "
+                     f"Percept: {perceptual_loss.item():.4f}, LR: {optimizer.param_groups[0]['lr']:.6f})")
 
         # 恢复最佳参数
         for k, v in best_params.items():
             self.gaussian_params[k].data = v
         return self.gaussians
     
-    def render_tensor(self, resolution=None):
-        """强制内存优化的渲染版本"""
+    def render_tensor(self, resolution=None, chunks=4):
+        """改进的内存优化渲染版本，支持分块渲染"""
         # 在开始渲染前强制释放所有缓存
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()  # 重置内存统计
-        
-        # 设置临时内存限制（根据实际可用内存调整）
-        max_mem = torch.cuda.get_device_properties(0).total_memory * 0.8  # 使用80%显存
-        torch.cuda.set_per_process_memory_fraction(0.8)  # 强制限制内存使用
+        torch.cuda.reset_peak_memory_stats()
         
         if self.gaussians is None:
-            return torch.zeros((10,10,3), dtype=torch.float32)  # 返回空图像
+            return torch.zeros((10,10,3), dtype=torch.float32)
             
         # 使用原始分辨率
         h, w = resolution if resolution else self.original_resolution
@@ -249,38 +336,67 @@ class GaussianSphereRepresentation:
         x_coords = (x_coords.clamp(0, w-1)).long()
         y_coords = (y_coords.clamp(0, h-1)).long()
         
-        # 创建空间索引网格
-        grid_x, grid_y = torch.meshgrid(
-            torch.arange(w, device=self.device),
-            torch.arange(h, device=self.device),
-            indexing='xy'
-        )
+        # 使用分块渲染减少内存占用
+        chunk_size = len(cam_positions) // chunks + 1
         
-        # 计算所有高斯的权重矩阵 [N, H, W]
-        dx = grid_x[None, :, :] - x_coords[:, None, None]
-        dy = grid_y[None, :, :] - y_coords[:, None, None]
-        dist = (dx**2 + dy**2) / (scales[:, 0, None, None]*100 + 1e-6)**2  # 防止除以零
-        weights = torch.exp(-torch.clamp(dist, max=10)) * opacities[:, None, None]  # 限制指数输入范围
+        # 创建输出图像和累积权重图
+        final_image = torch.zeros((h, w, 3), dtype=torch.float32, device=self.device)
+        accumulated_weights = torch.zeros((h, w, 1), dtype=torch.float32, device=self.device)
         
-        # 计算颜色贡献 [N, H, W, 3]
-        color_contrib = weights[..., None] * colors[:, None, None, :] * z_inv[:, None, None, None]
-        
-        # 使用索引掩码进行累加
-        valid_mask = (x_coords >= 0) & (x_coords < w) & (y_coords >= 0) & (y_coords < h)
-        color_contrib = color_contrib * valid_mask[:, None, None, None]
-        
-        # 使用张量操作代替循环累加
-        image = color_contrib.sum(dim=0)  # [H, W, 3]
-        alpha_sum = weights.sum(dim=0)[..., None]  # [H, W, 1]
+        # 分块处理高斯点
+        for chunk_idx in range(chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, len(cam_positions))
+            
+            if start_idx >= end_idx:
+                break
+            
+            # 获取当前块的数据
+            chunk_x_coords = x_coords[start_idx:end_idx]
+            chunk_y_coords = y_coords[start_idx:end_idx]
+            chunk_colors = colors[start_idx:end_idx]
+            chunk_scales = scales[start_idx:end_idx]
+            chunk_opacities = opacities[start_idx:end_idx]
+            chunk_z_inv = z_inv[start_idx:end_idx]
+            
+            # 创建空间索引网格 - 使用稀疏计算
+            grid_x, grid_y = torch.meshgrid(
+                torch.arange(w, device=self.device),
+                torch.arange(h, device=self.device),
+                indexing='xy'
+            )
+            
+            # 计算当前块高斯的权重矩阵
+            dx = grid_x[None, :, :] - chunk_x_coords[:, None, None]
+            dy = grid_y[None, :, :] - chunk_y_coords[:, None, None]
+            
+            # 优化内存使用的权重计算
+            dist = (dx**2 + dy**2) / (chunk_scales[:, 0, None, None]*100 + 1e-6)**2
+            weights = torch.exp(-torch.clamp(dist, max=10)) * chunk_opacities[:, None, None]
+            
+            # 计算颜色贡献
+            color_contrib = weights[..., None] * chunk_colors[:, None, None, :] * chunk_z_inv[:, None, None, None]
+            
+            # 过滤掉无效像素
+            valid_mask = (chunk_x_coords >= 0) & (chunk_x_coords < w) & (chunk_y_coords >= 0) & (chunk_y_coords < h)
+            color_contrib = color_contrib * valid_mask[:, None, None, None]
+            
+            # 累加到最终图像
+            final_image += color_contrib.sum(dim=0)
+            accumulated_weights += weights.sum(dim=0)[..., None]
+            
+            # 每块处理完后释放内存
+            del dx, dy, dist, weights, color_contrib
+            torch.cuda.empty_cache()
         
         # 归一化
-        image = torch.where(alpha_sum > 1e-6, image / alpha_sum, torch.tensor(0.0, device=self.device))
+        final_image = torch.where(
+            accumulated_weights > 1e-6, 
+            final_image / accumulated_weights, 
+            torch.tensor(0.0, device=self.device)
+        )
         
-        # 在渲染结束后立即释放中间变量
-        del color_contrib, weights, dx, dy
-        torch.cuda.empty_cache()
-        
-        return image
+        return final_image
     
     def render(self, resolution=None):
         """保持原有接口，但内部调用张量版本"""
@@ -381,22 +497,51 @@ def main():
         print(f"无法加载图片: {image_path}")
         return
     
-    # 创建3D高斯球表示
-    gs_model = GaussianSphereRepresentation(num_gaussians=2000)
-    gs_model.original_resolution = original_image.shape[:2]  # 保存原始分辨率
+    # GPU内存配置
+    torch.cuda.empty_cache()
+    # 设置PyTorch为确定性模式以提高稳定性
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True  # 启用基准优化
+    
+    # 创建3D高斯球表示 - 增加高斯数量
+    gs_model = GaussianSphereRepresentation(num_gaussians=3000)  # 增加高斯数量
+    
+    # 将图像调整为更合理的尺寸（如果需要）
+    scale_factor = 1.0  # 可根据GPU内存调整
+    if scale_factor != 1.0:
+        h, w = original_image.shape[:2]
+        original_image = cv2.resize(original_image, (int(w*scale_factor), int(h*scale_factor)))
+    
+    gs_model.original_resolution = original_image.shape[:2]
     
     # 初始化高斯球
     gaussians = gs_model.initialize_gaussians(original_image)
     
-    # 初始化后直接调用优化方法
-    gs_model.optimize_gaussians(original_image, iterations=500)
+    # 使用多阶段优化策略
+    print("第1阶段优化: 基础细节恢复")
+    gs_model.optimize_gaussians(original_image, iterations=300)  # 更多迭代次数
     
-    # 渲染并显示对比
+    # 保存中间结果（可选）
+    intermediate_render = gs_model.render()
+    cv2.imwrite("intermediate_result.png", (intermediate_render*255).astype(np.uint8))
+    
+    print("\n第2阶段优化: 细节增强")
+    # 使用更高学习率和更多迭代进行第二阶段优化
+    gs_model.optimize_gaussians(original_image, iterations=300)
+    
+    # 渲染最终结果
     rendered = gs_model.render()
     
     # 显示3D高斯球和渲染对比
-    gs_model.visualize_3d()  # 原有的3D可视化
-    gs_model.visualize_comparison(original_image, rendered)  # 新增的对比可视化
+    gs_model.visualize_3d()
+    gs_model.visualize_comparison(original_image, rendered)
+    
+    # 保存结果（可选）
+    cv2.imwrite("final_result.png", (rendered*255).astype(np.uint8))
+    
+    # 打印GPU内存使用情况
+    print(f"峰值GPU内存使用: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
+    print(f"当前GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
 
 if __name__ == "__main__":
