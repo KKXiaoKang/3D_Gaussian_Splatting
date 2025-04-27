@@ -192,7 +192,15 @@ class GaussianSphereRepresentation:
         return self.gaussians
     
     def render_tensor(self, resolution=None):
-        """返回保持梯度信息的张量版本（数值稳定版）"""
+        """强制内存优化的渲染版本"""
+        # 在开始渲染前强制释放所有缓存
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()  # 重置内存统计
+        
+        # 设置临时内存限制（根据实际可用内存调整）
+        max_mem = torch.cuda.get_device_properties(0).total_memory * 0.8  # 使用80%显存
+        torch.cuda.set_per_process_memory_fraction(0.8)  # 强制限制内存使用
+        
         if self.gaussians is None:
             return torch.zeros((10,10,3), dtype=torch.float32)  # 返回空图像
             
@@ -267,6 +275,11 @@ class GaussianSphereRepresentation:
         
         # 归一化
         image = torch.where(alpha_sum > 1e-6, image / alpha_sum, torch.tensor(0.0, device=self.device))
+        
+        # 在渲染结束后立即释放中间变量
+        del color_contrib, weights, dx, dy
+        torch.cuda.empty_cache()
+        
         return image
     
     def render(self, resolution=None):
