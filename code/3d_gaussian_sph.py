@@ -4,6 +4,7 @@ import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from sklearn.neighbors import NearestNeighbors
+import os
 
 class GaussianSphereRepresentation:
     def __init__(self, num_gaussians=1000):
@@ -488,6 +489,83 @@ class GaussianSphereRepresentation:
         plt.tight_layout()
         plt.show()
 
+    def save_model(self, filepath):
+        """
+        保存高斯球表示模型参数到PyTorch文件
+        
+        参数:
+            filepath: 保存模型的文件路径 (建议使用.pt或.pth后缀)
+        """
+        if self.gaussian_params is None:
+            print("错误: 模型尚未初始化，无法保存")
+            return False
+        
+        # 创建模型状态字典
+        state_dict = {
+            # 基本配置
+            'num_gaussians': self.num_gaussians,
+            'original_resolution': self.original_resolution,
+            
+            # 保存高斯参数（所有参数的实际数据）
+            'positions': self.gaussian_params['positions'].data.cpu(),  # 转移到CPU
+            'colors': self.gaussian_params['colors'].data.cpu(),
+            'opacities': self.gaussian_params['opacities'].data.cpu(),
+            'rotations': self.gaussian_params['rotations'].data.cpu(),
+            'scales': self.gaussian_params['scales'].data.cpu(),
+            'radii': self.gaussians['radii'].cpu()  # 非训练参数
+        }
+        
+        try:
+            # 保存到文件
+            torch.save(state_dict, filepath)
+            print(f"模型成功保存到: {filepath}")
+            print(f"保存的高斯球数量: {len(state_dict['positions'])}")
+            return True
+        except Exception as e:
+            print(f"保存模型时出错: {str(e)}")
+            return False
+
+    def load_model(self, filepath, device=None):
+        """
+        从PyTorch文件加载高斯球表示模型参数
+        
+        参数:
+            filepath: 模型文件路径
+            device: 指定加载到的设备，默认使用初始化时的设备
+        """
+        if device is None:
+            device = self.device
+        
+        try:
+            # 加载状态字典
+            state_dict = torch.load(filepath, map_location=device)
+            
+            # 恢复基本配置
+            self.num_gaussians = state_dict['num_gaussians']
+            self.original_resolution = state_dict['original_resolution']
+            
+            # 创建参数字典
+            self.gaussian_params = {
+                'positions': torch.nn.Parameter(state_dict['positions'].to(device)),
+                'colors': torch.nn.Parameter(state_dict['colors'].to(device)),
+                'opacities': torch.nn.Parameter(state_dict['opacities'].to(device)),
+                'rotations': torch.nn.Parameter(state_dict['rotations'].to(device)),
+                'scales': torch.nn.Parameter(state_dict['scales'].to(device))
+            }
+            
+            # 恢复gaussians字典
+            self.gaussians = {
+                'radii': state_dict['radii'].to(device),
+                **self.gaussian_params
+            }
+            
+            print(f"模型成功从 {filepath} 加载")
+            print(f"加载的高斯球数量: {len(self.gaussian_params['positions'])}")
+            return True
+        except Exception as e:
+            print(f"加载模型时出错: {str(e)}")
+            return False
+
 
 def main():
     # 加载图片（保持原始分辨率）
@@ -542,6 +620,32 @@ def main():
     # 打印GPU内存使用情况
     print(f"峰值GPU内存使用: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
     print(f"当前GPU内存使用: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+    # 保存模型
+    model_path = "./saved_models/gaussian_model_lena.pt"
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)  # 确保目录存在
+    gs_model.save_model(model_path)
+
+
+def load_and_render():
+    # 创建一个新的模型实例
+    gs_model = GaussianSphereRepresentation()
+    
+    # 加载保存的模型
+    model_path = "./saved_models/gaussian_model_lena.pt"
+    gs_model.load_model(model_path)
+    
+    # 渲染图像
+    rendered = gs_model.render()
+    
+    # 显示渲染结果
+    plt.imshow(rendered)
+    plt.axis('off')
+    plt.title('Rendered from Loaded Model')
+    plt.show()
+    
+    # 如果需要，可以继续训练
+    # gs_model.optimize_gaussians(some_image, iterations=100)
 
 
 if __name__ == "__main__":
