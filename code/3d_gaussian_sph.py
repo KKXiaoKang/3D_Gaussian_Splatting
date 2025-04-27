@@ -16,6 +16,8 @@ class GaussianSphereRepresentation:
         self.num_gaussians = num_gaussians
         self.gaussians = None
         self.original_resolution = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.gaussian_params = None  # 新增参数容器
         
     def _generate_point_cloud(self, image, num_points=2000):
         """
@@ -52,17 +54,27 @@ class GaussianSphereRepresentation:
         # 生成模拟SfM点云
         point_cloud = self._generate_point_cloud(image, self.num_gaussians)
         
+        # 检查点云数据有效性
+        if not np.isfinite(point_cloud).all():
+            raise ValueError("生成的初始点云包含非法值")
+        
         # 计算K近邻半径
         radii = self._knn_radius(point_cloud, k=3)
         
-        # 初始化高斯参数
+        # 修改为使用Parameter存储可训练参数
+        self.gaussian_params = {
+            'positions': torch.nn.Parameter(torch.tensor(point_cloud, dtype=torch.float32).to(self.device)),
+            'colors': torch.nn.Parameter(torch.tensor(self._sample_colors(image, point_cloud), 
+                                  dtype=torch.float32).to(self.device)),
+            'opacities': torch.nn.Parameter(torch.tensor(np.random.uniform(0.7, 0.95, len(point_cloud)), 
+                                   dtype=torch.float32).to(self.device)),
+            'rotations': torch.nn.Parameter(torch.rand(len(point_cloud), 4).to(self.device)),
+            'scales': torch.nn.Parameter(torch.ones((len(point_cloud), 3)).to(self.device) * 0.1)
+        }
+        # 非训练参数保持原样
         self.gaussians = {
-            'positions': point_cloud,
-            'radii': radii,
-            'colors': self._sample_colors(image, point_cloud),
-            'opacities': np.random.uniform(0.7, 0.95, len(point_cloud)),
-            'rotations': np.random.rand(len(point_cloud), 4),  # 四元数
-            'scales': np.ones((len(point_cloud), 3)) * 0.1  # 初始缩放
+            'radii': torch.tensor(radii, dtype=torch.float32).to(self.device),
+            **self.gaussian_params
         }
         self.original_resolution = image.shape[:2]  # 保存原始分辨率
         return self.gaussians
@@ -79,51 +91,121 @@ class GaussianSphereRepresentation:
             colors.append(image[y, x]/255.0)
         return np.array(colors)
     
+    def _ssim_loss(self, img1, img2, window_size=11):
+        # 修改输入维度处理
+        def rgb2gray(img):
+            return 0.299 * img[...,0] + 0.587 * img[...,1] + 0.114 * img[...,2]
+        
+        # 转换到灰度并增加维度 [B, C, H, W]
+        img1_gray = rgb2gray(img1).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        img2_gray = rgb2gray(img2).unsqueeze(0).unsqueeze(0)
+        
+        # 创建高斯窗口（保持单通道）
+        weights = torch.FloatTensor(np.exp(-0.5*np.square(np.linspace(-1.5,1.5,window_size)))).to(img1.device)
+        weights = (weights.outer(weights)).view(1,1,window_size,window_size)
+        weights /= weights.sum()
+        
+        # 计算统计量
+        mu1 = torch.nn.functional.conv2d(img1_gray, weights, padding=window_size//2)
+        mu2 = torch.nn.functional.conv2d(img2_gray, weights, padding=window_size//2)
+        
+        sigma1_sq = torch.nn.functional.conv2d(img1_gray**2, weights, padding=window_size//2) - mu1**2
+        sigma2_sq = torch.nn.functional.conv2d(img2_gray**2, weights, padding=window_size//2) - mu2**2
+        sigma12 = torch.nn.functional.conv2d(img1_gray*img2_gray, weights, padding=window_size//2) - mu1*mu2
+        
+        # SSIM参数
+        C1 = 0.01**2
+        C2 = 0.03**2
+        
+        ssim_map = ((2*mu1*mu2 + C1)*(2*sigma12 + C2)) / \
+                  ((mu1**2 + mu2**2 + C1)*(sigma1_sq + sigma2_sq + C2))
+        return 1 - ssim_map.mean()
+
     def optimize_gaussians(self, target_image, iterations=100):
         """
-        优化高斯球参数以更好地拟合目标图像
-        
-        参数:
-            target_image: 目标图像
-            iterations: 优化迭代次数
+        完整的优化流程（修复NaN问题版本）
         """
-        # 这里应该实现优化算法，例如梯度下降
-        # 为简化示例，这里只展示一个框架
-        for i in range(iterations):
-            # 1. 渲染当前高斯球
-            rendered = self.render()
-            
-            # 2. 计算与目标图像的差异
-            # loss = compute_loss(rendered, target_image)
-            
-            # 3. 更新高斯球参数
-            # self.update_parameters(loss)
-            
-            print(f"Iteration {i+1}/{iterations}")
+        # 准备目标图像
+        h, w = self.original_resolution
+        target_tensor = torch.tensor(cv2.resize(target_image, (w, h)) / 255.0, 
+                                   dtype=torch.float32).to(self.device)
         
+        # 调整优化器参数（降低学习率，添加梯度裁剪）
+        optimizer = torch.optim.Adam([
+            {'params': self.gaussian_params['positions'], 'lr': 0.0001},  # 降低10倍
+            {'params': self.gaussian_params['colors'], 'lr': 0.005},
+            {'params': self.gaussian_params['opacities'], 'lr': 0.01},
+            {'params': self.gaussian_params['scales'], 'lr': 0.001},
+            {'params': self.gaussian_params['rotations'], 'lr': 0.0001}
+        ])
+        
+        # 混合损失权重
+        loss_weights = {'l1': 0.8, 'ssim': 0.2}
+        
+        best_loss = float('inf')
+        for i in range(iterations):
+            optimizer.zero_grad()
+            
+            # 添加渲染保护机制
+            with torch.autograd.detect_anomaly():
+                rendered_tensor = self.render_tensor()
+                
+                # 计算混合损失
+                l1_loss = torch.nn.L1Loss()(rendered_tensor, target_tensor)
+                ssim_loss = self._ssim_loss(rendered_tensor, target_tensor)
+                total_loss = loss_weights['l1']*l1_loss + loss_weights['ssim']*ssim_loss
+                
+                # 添加正则化项防止数值爆炸
+                reg_loss = torch.mean(torch.abs(self.gaussian_params['positions'])) * 0.01
+                total_loss += reg_loss
+
+                # 反向传播和优化（添加梯度裁剪）
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.gaussian_params['positions'], 1.0)
+                torch.nn.utils.clip_grad_norm_(self.gaussian_params['scales'], 0.1)
+                optimizer.step()
+            
+            # 参数约束（添加更严格的限制）
+            with torch.no_grad():
+                self.gaussian_params['opacities'].data = self.gaussian_params['opacities'].clamp(0.1, 0.9)
+                self.gaussian_params['colors'].data = self.gaussian_params['colors'].clamp(0.1, 0.9)
+                self.gaussian_params['scales'].data = self.gaussian_params['scales'].clamp(0.05, 0.3)
+                # 防止位置参数爆炸
+                self.gaussian_params['positions'].data = self.gaussian_params['positions'].clamp(-3, 3)
+            
+            # 检查NaN并提前终止
+            if torch.isnan(total_loss):
+                print("检测到NaN损失值，恢复最佳参数并终止优化")
+                break
+            
+            # 保存最佳参数
+            if total_loss < best_loss:
+                best_loss = total_loss
+                best_params = {k: v.clone() for k,v in self.gaussian_params.items()}
+            
+            print(f"Iter {i+1}/{iterations} Loss: {total_loss.item():.4f} "
+                 f"(L1: {l1_loss.item():.4f}, SSIM: {ssim_loss.item():.4f})")
+
+        # 恢复最佳参数
+        for k, v in best_params.items():
+            self.gaussian_params[k].data = v
         return self.gaussians
     
-    def render(self, resolution=None):
-        """
-        基于高斯泼溅的渲染实现
-        """
+    def render_tensor(self, resolution=None):
+        """返回保持梯度信息的张量版本（数值稳定版）"""
         if self.gaussians is None:
-            return np.zeros((10,10,3))  # 返回空图像
+            return torch.zeros((10,10,3), dtype=torch.float32)  # 返回空图像
             
         # 使用原始分辨率
         h, w = resolution if resolution else self.original_resolution
         
-        # 转换为PyTorch张量加速计算
-        positions = torch.tensor(self.gaussians['positions'], dtype=torch.float32)
-        colors = torch.tensor(self.gaussians['colors'], dtype=torch.float32)
-        scales = torch.tensor(self.gaussians['scales'], dtype=torch.float32)
-        rotations = torch.tensor(self.gaussians['rotations'], dtype=torch.float32)
-        opacities = torch.tensor(self.gaussians['opacities'], dtype=torch.float32)
+        # 修改为使用GPU加速
+        positions = self.gaussian_params['positions'].to(self.device)
+        colors = self.gaussian_params['colors'].to(self.device)
+        scales = self.gaussian_params['scales'].to(self.device)
+        rotations = self.gaussian_params['rotations'].to(self.device)
+        opacities = self.gaussian_params['opacities'].to(self.device)
 
-        # 创建渲染画布 [H, W, 3]
-        image = torch.zeros((h, w, 3), dtype=torch.float32)
-        alpha_sum = torch.zeros((h, w, 1), dtype=torch.float32)
-        
         # 相机参数 (简单正交投影)
         focal_length = 1.0
         view_matrix = torch.tensor([
@@ -131,11 +213,14 @@ class GaussianSphereRepresentation:
             [0,1,0,0],
             [0,0,1,0],
             [0,0,0,1]
-        ], dtype=torch.float32)
+        ], dtype=torch.float32, device=self.device)
 
         # 将高斯转换到相机坐标系
         cam_positions = torch.matmul(
-            torch.cat([positions, torch.ones(len(positions), 1)], dim=1), 
+            torch.cat([
+                positions, 
+                torch.ones(len(positions), 1, device=self.device)
+            ], dim=1), 
             view_matrix.T
         )[:, :3]
 
@@ -148,38 +233,45 @@ class GaussianSphereRepresentation:
         opacities = opacities[valid_mask]
 
         # 计算2D投影坐标 (透视投影)
-        x_proj = (cam_positions[:, 0] / cam_positions[:, 2] * focal_length + 1) * w / 2
-        y_proj = (-cam_positions[:, 1] / cam_positions[:, 2] * focal_length + 1) * h / 2
+        x_coords = (cam_positions[:, 0] / cam_positions[:, 2] * focal_length + 1) * w / 2
+        y_coords = (-cam_positions[:, 1] / cam_positions[:, 2] * focal_length + 1) * h / 2
         z_inv = 1.0 / cam_positions[:, 2]
 
-        # 为每个高斯生成2D协方差矩阵
-        # (这里简化实现，实际需要根据旋转和缩放计算)
-        cov2d = torch.stack([
-            scales[:,0]*100, 
-            torch.zeros_like(scales[:,0]),
-            torch.zeros_like(scales[:,0]),
-            scales[:,1]*100
-        ], dim=1).reshape(-1,2,2)
-
-        # 遍历所有高斯（实际应使用空间加速结构）
-        for i in range(len(cam_positions)):
-            x = int(x_proj[i])
-            y = int(y_proj[i])
-            if 0 <= x < w and 0 <= y < h:
-                # 计算高斯权重
-                dx = torch.arange(w) - x
-                dy = torch.arange(h) - y
-                grid_x, grid_y = torch.meshgrid(dx, dy, indexing='xy')
-                dist = (grid_x**2 + grid_y**2) / (scales[i,0]*100)**2
-                weight = torch.exp(-dist) * opacities[i]
-                
-                # 累加颜色
-                image += weight[..., None] * colors[i] * z_inv[i]
-                alpha_sum += weight[..., None]
-
-        # 归一化并转换为numpy数组
-        image = torch.where(alpha_sum > 0, image / alpha_sum, torch.tensor(0.0))
-        return image.numpy()
+        # 使用向量化操作代替循环
+        x_coords = (x_coords.clamp(0, w-1)).long()
+        y_coords = (y_coords.clamp(0, h-1)).long()
+        
+        # 创建空间索引网格
+        grid_x, grid_y = torch.meshgrid(
+            torch.arange(w, device=self.device),
+            torch.arange(h, device=self.device),
+            indexing='xy'
+        )
+        
+        # 计算所有高斯的权重矩阵 [N, H, W]
+        dx = grid_x[None, :, :] - x_coords[:, None, None]
+        dy = grid_y[None, :, :] - y_coords[:, None, None]
+        dist = (dx**2 + dy**2) / (scales[:, 0, None, None]*100 + 1e-6)**2  # 防止除以零
+        weights = torch.exp(-torch.clamp(dist, max=10)) * opacities[:, None, None]  # 限制指数输入范围
+        
+        # 计算颜色贡献 [N, H, W, 3]
+        color_contrib = weights[..., None] * colors[:, None, None, :] * z_inv[:, None, None, None]
+        
+        # 使用索引掩码进行累加
+        valid_mask = (x_coords >= 0) & (x_coords < w) & (y_coords >= 0) & (y_coords < h)
+        color_contrib = color_contrib * valid_mask[:, None, None, None]
+        
+        # 使用张量操作代替循环累加
+        image = color_contrib.sum(dim=0)  # [H, W, 3]
+        alpha_sum = weights.sum(dim=0)[..., None]  # [H, W, 1]
+        
+        # 归一化
+        image = torch.where(alpha_sum > 1e-6, image / alpha_sum, torch.tensor(0.0, device=self.device))
+        return image
+    
+    def render(self, resolution=None):
+        """保持原有接口，但内部调用张量版本"""
+        return self.render_tensor(resolution).detach().cpu().numpy()
     
     def visualize_3d(self):
         """可视化3D高斯球表示"""
@@ -187,12 +279,44 @@ class GaussianSphereRepresentation:
             print("请先初始化高斯球")
             return
             
+        # 添加数据有效性检查
+        positions = self.gaussian_params['positions'].detach().cpu().numpy()
+        
+        # 检查NaN/Inf
+        if not np.isfinite(positions).all():
+            print("警告：检测到非法坐标值（NaN/Inf），无法可视化")
+            return
+        
+        # 创建3D坐标系
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
         
-        positions = self.gaussians['positions']
-        colors = self.gaussians['colors']
-        radii = self.gaussians['radii']
+        # 计算坐标范围（增加容错机制）
+        coord_ranges = []
+        mid_points = []
+        for dim in range(3):
+            dim_min = positions[:, dim].min()
+            dim_max = positions[:, dim].max()
+            
+            # 处理所有点在同一位置的情况
+            if dim_max - dim_min < 1e-6:
+                dim_min -= 0.5
+                dim_max += 0.5
+            
+            coord_ranges.append(dim_max - dim_min)
+            mid_points.append((dim_min + dim_max) / 2)
+        
+        max_range = max(coord_ranges) / 2
+        
+        # 设置坐标轴范围
+        ax.set_xlim(mid_points[0] - max_range, mid_points[0] + max_range)
+        ax.set_ylim(mid_points[1] - max_range, mid_points[1] + max_range)
+        ax.set_zlim(mid_points[2] - max_range, mid_points[2] + max_range)
+        
+        # 添加detach()并转换为numpy
+        positions = self.gaussian_params['positions'].detach().cpu().numpy()
+        colors = self.gaussian_params['colors'].detach().cpu().numpy()
+        radii = self.gaussians['radii'].detach().cpu().numpy()
         
         # 绘制散点图，点大小由半径决定
         scatter = ax.scatter(
@@ -213,21 +337,6 @@ class GaussianSphereRepresentation:
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
         ax.set_title('3D Gaussian Sphere Representation')
-        
-        # 设置等比例轴
-        max_range = np.array([
-            positions[:,0].max()-positions[:,0].min(),
-            positions[:,1].max()-positions[:,1].min(),
-            positions[:,2].max()-positions[:,2].min()
-        ]).max() / 2.0
-        
-        mid_x = (positions[:,0].max()+positions[:,0].min()) * 0.5
-        mid_y = (positions[:,1].max()+positions[:,1].min()) * 0.5
-        mid_z = (positions[:,2].max()+positions[:,2].min()) * 0.5
-        
-        ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        ax.set_zlim(mid_z - max_range, mid_z + max_range)
         
         plt.tight_layout()
 
@@ -265,6 +374,9 @@ def main():
     
     # 初始化高斯球
     gaussians = gs_model.initialize_gaussians(original_image)
+    
+    # 初始化后直接调用优化方法
+    gs_model.optimize_gaussians(original_image, iterations=500)
     
     # 渲染并显示对比
     rendered = gs_model.render()
