@@ -504,7 +504,7 @@ def main():
     torch.backends.cudnn.benchmark = True  # 启用基准优化
     
     # 创建3D高斯球表示 - 增加高斯数量
-    gs_model = GaussianSphereRepresentation(num_gaussians=3000)  # 增加高斯数量
+    gs_model = GaussianSphereRepresentation(num_gaussians=10000)  # 增加高斯数量
     
     # 将图像调整为更合理的尺寸（如果需要）
     scale_factor = 1.0  # 可根据GPU内存调整
