@@ -1011,6 +1011,7 @@ def main():
     # 显示3D高斯球和渲染对比
     gs_model.visualize_3d()
     gs_model.visualize_comparison(original_image, rendered)
+    plt.show()
     
     # 保存结果（可选）
     cv2.imwrite("final_result.png", (rendered*255).astype(np.uint8))
