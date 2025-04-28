@@ -124,7 +124,7 @@ class GaussianSphereRepresentation:
 
     def optimize_gaussians(self, target_image, iterations=100):
         """
-        改进的优化流程，包含学习率调度和梯度累积
+        改进的优化流程，包含学习率调度、梯度累积和点密集化/剪枝
         """
         # 准备目标图像
         h, w = self.original_resolution
@@ -165,6 +165,18 @@ class GaussianSphereRepresentation:
         # 释放并预留GPU内存
         torch.cuda.empty_cache()
         torch.cuda.set_per_process_memory_fraction(0.9)  # 增加到90%
+        
+        # 点密集化和剪枝的控制参数
+        densify_interval = 50    # 每50次迭代执行一次密集化
+        split_interval = 70      # 每70次迭代执行一次分割
+        prune_interval = 40      # 每40次迭代执行一次剪枝
+        
+        # 高斯分割参数随训练阶段变化
+        split_phases = [
+            (0.3, 0.4, 500),     # (前30%迭代, 尺寸阈值, 最大分割数)
+            (0.6, 0.3, 1000),    # (前60%迭代, 更低尺寸阈值, 更多分割)
+            (0.8, 0.25, 1500),   # (前80%迭代, 最低尺寸阈值, 最多分割)
+        ]
         
         for i in range(iterations):
             optimizer.zero_grad()
@@ -278,6 +290,98 @@ class GaussianSphereRepresentation:
                      f"(L1: {l1_loss.item():.4f}, SSIM: {ssim_loss.item():.4f}, "
                      f"Percept: {perceptual_loss.item():.4f}, LR: {optimizer.param_groups[0]['lr']:.6f})")
 
+            # 在适当的迭代点执行密集化
+            if (i + 1) % densify_interval == 0 and i < iterations * 0.8:
+                # 根据训练进度确定密集化参数
+                progress = i / iterations
+                grad_threshold = 0.05  # 默认值
+                max_new = 500         # 默认值
+                
+                # 根据训练阶段调整参数
+                for phase_end, thresh, max_count in split_phases:
+                    if progress <= phase_end:
+                        grad_threshold = thresh
+                        max_new = max_count
+                        break
+                
+                self.densify_gaussians(grad_threshold=grad_threshold, 
+                                      max_new_gaussians=max_new)
+                
+                # 重新创建优化器以包含新增的参数
+                optimizer = torch.optim.Adam([
+                    {'params': self.gaussian_params['positions'], 'lr': 0.0005},
+                    {'params': self.gaussian_params['colors'], 'lr': 0.01},
+                    {'params': self.gaussian_params['opacities'], 'lr': 0.02},
+                    {'params': self.gaussian_params['scales'], 'lr': 0.002},
+                    {'params': self.gaussian_params['rotations'], 'lr': 0.0005}
+                ])
+                
+                # 重新创建学习率调度器
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=50, T_mult=2, eta_min=1e-6
+                )
+            
+            # 在适当的迭代点执行剪枝
+            if (i + 1) % prune_interval == 0 and i > iterations * 0.1:
+                # 根据训练进度确定剪枝参数
+                progress = i / iterations
+                opacity_thresh = 0.02  # 默认值
+                scale_thresh = 0.5     # 默认值
+                
+                # 根据训练阶段调整参数
+                for phase_end, op_thresh, sc_thresh in split_phases:
+                    if progress <= phase_end:
+                        opacity_thresh = op_thresh
+                        scale_thresh = sc_thresh
+                        break
+                
+                self.prune_gaussians(opacity_threshold=opacity_thresh, 
+                                   scale_threshold=scale_thresh)
+                
+                # 重新创建优化器以适应剪枝后的参数
+                optimizer = torch.optim.Adam([
+                    {'params': self.gaussian_params['positions'], 'lr': 0.0005},
+                    {'params': self.gaussian_params['colors'], 'lr': 0.01},
+                    {'params': self.gaussian_params['opacities'], 'lr': 0.02},
+                    {'params': self.gaussian_params['scales'], 'lr': 0.002},
+                    {'params': self.gaussian_params['rotations'], 'lr': 0.0005}
+                ])
+                
+                # 重新创建学习率调度器
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=50, T_mult=2, eta_min=1e-6
+                )
+            
+            # 在适当的迭代点执行高斯分割
+            if (i + 1) % split_interval == 0 and i < iterations * 0.7:
+                # 根据训练进度确定分割参数
+                progress = i / iterations
+                scale_thresh = 0.4  # 默认值
+                max_split = 500     # 默认值
+                
+                # 根据训练阶段调整参数
+                for phase_end, sc_thresh, max_count in split_phases:
+                    if progress <= phase_end:
+                        scale_thresh = sc_thresh
+                        max_split = max_count
+                        break
+                
+                self.split_large_gaussians(scale_threshold=scale_thresh,
+                                         max_splits=max_split)
+                
+                # 重新创建优化器和调度器
+                optimizer = torch.optim.Adam([
+                    {'params': self.gaussian_params['positions'], 'lr': 0.0005},
+                    {'params': self.gaussian_params['colors'], 'lr': 0.01},
+                    {'params': self.gaussian_params['opacities'], 'lr': 0.02},
+                    {'params': self.gaussian_params['scales'], 'lr': 0.002},
+                    {'params': self.gaussian_params['rotations'], 'lr': 0.0005}
+                ])
+                
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=50, T_mult=2, eta_min=1e-6
+                )
+        
         # 恢复最佳参数
         for k, v in best_params.items():
             self.gaussian_params[k].data = v
@@ -446,7 +550,27 @@ class GaussianSphereRepresentation:
         # 添加detach()并转换为numpy
         positions = self.gaussian_params['positions'].detach().cpu().numpy()
         colors = self.gaussian_params['colors'].detach().cpu().numpy()
-        radii = self.gaussians['radii'].detach().cpu().numpy()
+        
+        # 检查radii是否与positions具有相同的维度
+        if len(self.gaussians['radii']) != len(positions):
+            print(f"警告: radii维度 ({len(self.gaussians['radii'])}) 与 positions维度 ({len(positions)}) 不匹配")
+            # 使用统一大小代替
+            radii = np.ones(len(positions)) * 0.05
+        else:
+            radii = self.gaussians['radii'].detach().cpu().numpy()
+        
+        # 确保所有维度一致
+        n_points = len(positions)
+        if len(colors) != n_points:
+            print(f"警告: colors维度 ({len(colors)}) 与 positions维度 ({n_points}) 不匹配")
+            colors = np.ones((n_points, 3)) * 0.5  # 使用灰色
+        
+        # 为安全起见，处理可能的维度不匹配或NaN值
+        if len(radii) != n_points:
+            radii = np.ones(n_points) * 0.05
+        
+        # 清理任何可能的NaN或Inf值
+        radii = np.nan_to_num(radii, nan=0.05, posinf=0.1, neginf=0.05)
         
         # 绘制散点图，点大小由半径决定
         scatter = ax.scatter(
@@ -454,7 +578,7 @@ class GaussianSphereRepresentation:
             positions[:, 1], 
             positions[:, 2],
             c=colors,
-            s=radii*1000,
+            s=radii*1000,  # 确保这里的半径是一个标量或与位置数组长度匹配的数组
             alpha=0.6,
             depthshade=True  # 启用深度阴影
         )
@@ -469,6 +593,7 @@ class GaussianSphereRepresentation:
         ax.set_title('3D Gaussian Sphere Representation')
         
         plt.tight_layout()
+        # plt.show()
 
     def visualize_comparison(self, original_image, rendered_image):
         """
@@ -487,7 +612,7 @@ class GaussianSphereRepresentation:
         ax2.axis('off')
         
         plt.tight_layout()
-        plt.show()
+        # plt.show()
 
     def save_model(self, filepath):
         """
@@ -565,6 +690,279 @@ class GaussianSphereRepresentation:
         except Exception as e:
             print(f"加载模型时出错: {str(e)}")
             return False
+
+    def _compute_view_space_gradients(self, rendered_tensor, target_tensor):
+        """计算视图空间梯度来识别需要密集化的区域"""
+        # 计算L1差异作为简单的视图空间梯度指标
+        view_grad = torch.abs(rendered_tensor - target_tensor).mean(dim=-1)
+        
+        # 将梯度映射回高斯位置
+        h, w = self.original_resolution
+        positions = self.gaussian_params['positions'].detach()
+        
+        # 投影到2D
+        projected_positions = torch.zeros((len(positions), 2), device=self.device)
+        projected_positions[:, 0] = (positions[:, 0] + 1) * w / 2
+        projected_positions[:, 1] = (-positions[:, 1] + 1) * h / 2
+        
+        # 限制在图像边界内
+        projected_positions[:, 0] = projected_positions[:, 0].clamp(0, w-1)
+        projected_positions[:, 1] = projected_positions[:, 1].clamp(0, h-1)
+        
+        # 采样每个高斯位置的梯度
+        gaussian_grads = torch.zeros(len(positions), device=self.device)
+        for i, (x, y) in enumerate(projected_positions):
+            x_int, y_int = int(x), int(y)
+            gaussian_grads[i] = view_grad[y_int, x_int]
+        
+        return gaussian_grads
+
+    def densify_gaussians(self, grad_threshold=0.01, clone_percentage=0.05, max_new_gaussians=2000):
+        """基于视图空间梯度增加高斯密度"""
+        if self.gaussians is None:
+            return
+        
+        # 渲染当前图像以计算视图空间梯度
+        h, w = self.original_resolution
+        target_image = self.render()
+        target_tensor = torch.tensor(target_image, dtype=torch.float32).to(self.device)
+        rendered_tensor = self.render_tensor()
+        
+        # 计算每个高斯的视图空间梯度
+        gaussian_grads = self._compute_view_space_gradients(rendered_tensor, target_tensor)
+        
+        # 确定需要克隆的高斯
+        grad_threshold_value = torch.quantile(gaussian_grads, 1 - clone_percentage)
+        candidates_mask = gaussian_grads > grad_threshold_value
+        
+        if candidates_mask.sum() == 0:
+            print("没有找到需要密集化的高斯")
+            return
+        
+        # 限制克隆数量
+        max_clones = min(int(candidates_mask.sum().item()), max_new_gaussians)
+        if max_clones == 0:
+            return
+        
+        # 获取要克隆的高斯索引
+        clone_indices = torch.where(candidates_mask)[0]
+        if len(clone_indices) > max_clones:
+            # 如果候选太多，选择梯度最高的部分
+            _, top_indices = torch.topk(gaussian_grads[candidates_mask], max_clones)
+            clone_indices = clone_indices[top_indices]
+        
+        print(f"正在克隆 {len(clone_indices)} 个高斯...")
+        
+        # 克隆高斯 - 为每个需要扩展的位置创建一个副本
+        positions = self.gaussian_params['positions'].detach().clone()
+        colors = self.gaussian_params['colors'].detach().clone()
+        opacities = self.gaussian_params['opacities'].detach().clone()
+        rotations = self.gaussian_params['rotations'].detach().clone()
+        scales = self.gaussian_params['scales'].detach().clone()
+        
+        # 创建新的高斯
+        new_positions = positions[clone_indices].clone()
+        new_colors = colors[clone_indices].clone()
+        new_opacities = opacities[clone_indices].clone() * 0.8  # 稍微降低透明度
+        new_rotations = rotations[clone_indices].clone()
+        new_scales = scales[clone_indices].clone() * 0.7  # 缩小尺寸
+        
+        # 添加位置扰动 - 主要沿着相机方向
+        position_noise = torch.randn_like(new_positions) * 0.05
+        new_positions = new_positions + position_noise
+        
+        # 合并原始高斯和新高斯
+        self.gaussian_params['positions'] = torch.nn.Parameter(
+            torch.cat([positions, new_positions], dim=0)
+        )
+        self.gaussian_params['colors'] = torch.nn.Parameter(
+            torch.cat([colors, new_colors], dim=0)
+        )
+        self.gaussian_params['opacities'] = torch.nn.Parameter(
+            torch.cat([opacities, new_opacities], dim=0)
+        )
+        self.gaussian_params['rotations'] = torch.nn.Parameter(
+            torch.cat([rotations, new_rotations], dim=0)
+        )
+        self.gaussian_params['scales'] = torch.nn.Parameter(
+            torch.cat([scales, new_scales], dim=0)
+        )
+        
+        # 更新非训练参数
+        radii = self.gaussians['radii'].clone()
+        new_radii = radii[clone_indices].clone() * 0.7
+        self.gaussians = {
+            'radii': torch.cat([radii, new_radii], dim=0).to(self.device),
+            **self.gaussian_params
+        }
+        
+        # 在克隆操作结束后，检查并确保radii的维度正确
+        if len(self.gaussians['radii']) != len(self.gaussian_params['positions']):
+            print(f"修复密集化后的radii维度 (从 {len(self.gaussians['radii'])} 到 {len(self.gaussian_params['positions'])})")
+            # 重新创建radii字典
+            self.gaussians = {
+                'radii': torch.cat([radii, new_radii], dim=0).to(self.device),
+                **self.gaussian_params
+            }
+        
+        print(f"密集化后的高斯数量: {len(self.gaussian_params['positions'])}")
+        print(f"参数维度检查 - positions: {len(self.gaussian_params['positions'])}, radii: {len(self.gaussians['radii'])}")
+
+    def prune_gaussians(self, opacity_threshold=0.05, scale_threshold=0.5):
+        """剪枝透明度低和尺寸过大的高斯"""
+        if self.gaussians is None:
+            return
+        
+        # 获取当前高斯参数
+        opacities = self.gaussian_params['opacities'].detach()
+        scales = self.gaussian_params['scales'].detach()
+        
+        # 首先检查维度是否一致，如果不一致，重新创建radii
+        if len(self.gaussians['radii']) != len(opacities):
+            print(f"警告: 检测到radii维度不匹配 ({len(self.gaussians['radii'])} vs {len(opacities)})")
+            # 使用一个合理的默认值重新创建radii
+            self.gaussians['radii'] = torch.ones_like(opacities) * 0.05
+        
+        # 计算尺寸大小 (使用最大尺度值作为判断依据)
+        scale_values = scales.max(dim=1)[0]
+        
+        # 创建保留掩码
+        opacity_mask = opacities > opacity_threshold  # 保留透明度高的
+        scale_mask = scale_values < scale_threshold   # 保留尺寸小的
+        
+        # 位置约束 - 确保高斯不会太远离兴趣区域
+        positions = self.gaussian_params['positions'].detach()
+        position_mask = torch.all(torch.abs(positions) < 5.0, dim=1)  # 限制在合理范围内
+        
+        # 合并所有条件
+        keep_mask = opacity_mask & scale_mask & position_mask
+        
+        # 如果要删除的太多，只保留一定比例的最佳高斯
+        keep_count = keep_mask.sum().item()
+        total_count = len(opacities)
+        if keep_count < total_count * 0.5:  # 如果要删除超过50%，做保护
+            # 计算综合分数 (高透明度和合适尺寸的高分)
+            scores = opacities * (1.0 - scale_values/scale_threshold)
+            # 保留最高分的50%
+            threshold = torch.quantile(scores, 0.5)
+            keep_mask = scores > threshold
+        
+        # 计算剪枝数量
+        pruned_count = total_count - keep_mask.sum().item()
+        
+        if pruned_count > 0:
+            print(f"正在剪枝 {pruned_count} 个高斯 (保留 {keep_mask.sum().item()})")
+            
+            # 更新所有参数
+            for param_name in self.gaussian_params:
+                self.gaussian_params[param_name] = torch.nn.Parameter(
+                    self.gaussian_params[param_name][keep_mask].clone()
+                )
+            
+            # 更新gaussians字典
+            self.gaussians = {
+                'radii': self.gaussians['radii'][keep_mask].clone(),
+                **self.gaussian_params
+            }
+
+    def split_large_gaussians(self, scale_threshold=0.3, max_splits=1000):
+        """将大高斯分割成更小的高斯对"""
+        if self.gaussians is None:
+            return
+        
+        # 获取当前高斯参数
+        positions = self.gaussian_params['positions'].detach()
+        colors = self.gaussian_params['colors'].detach()
+        opacities = self.gaussian_params['opacities'].detach()
+        rotations = self.gaussian_params['rotations'].detach()
+        scales = self.gaussian_params['scales'].detach()
+        
+        # 找出需要分割的大高斯
+        scale_values = scales.max(dim=1)[0]
+        split_mask = scale_values > scale_threshold
+        
+        # 获取需要分割的高斯索引
+        split_indices = torch.where(split_mask)[0]
+        if len(split_indices) == 0:
+            print("没有找到需要分割的大高斯")
+            return
+        
+        # 限制分割数量
+        if len(split_indices) > max_splits:
+            # 选择最大的高斯分割
+            scale_values_to_split = scale_values[split_indices]
+            _, top_indices = torch.topk(scale_values_to_split, max_splits)
+            split_indices = split_indices[top_indices]
+        
+        print(f"分割 {len(split_indices)} 个大高斯...")
+        
+        # 为每个被分割的高斯创建两个新的小高斯
+        num_splits = len(split_indices)
+        
+        # 准备新高斯参数
+        new_positions = torch.zeros((num_splits * 2, 3), device=self.device)
+        new_colors = torch.zeros((num_splits * 2, 3), device=self.device)
+        new_opacities = torch.zeros(num_splits * 2, device=self.device)
+        new_rotations = torch.zeros((num_splits * 2, 4), device=self.device)
+        new_scales = torch.zeros((num_splits * 2, 3), device=self.device)
+        
+        # 随机分割方向
+        split_dirs = torch.randn((num_splits, 3), device=self.device)
+        split_dirs = split_dirs / (split_dirs.norm(dim=1, keepdim=True) + 1e-8)
+        
+        # 分割距离与原始尺寸成比例
+        split_distances = scale_values[split_indices] * 0.3
+        
+        # 创建分割高斯
+        for i, idx in enumerate(split_indices):
+            # 第一个分割高斯
+            new_positions[i*2] = positions[idx] + split_dirs[i] * split_distances[i]
+            new_colors[i*2] = colors[idx]
+            new_opacities[i*2] = opacities[idx] * 0.5
+            new_rotations[i*2] = rotations[idx]
+            new_scales[i*2] = scales[idx] * 0.5
+            
+            # 第二个分割高斯
+            new_positions[i*2+1] = positions[idx] - split_dirs[i] * split_distances[i]
+            new_colors[i*2+1] = colors[idx]
+            new_opacities[i*2+1] = opacities[idx] * 0.5
+            new_rotations[i*2+1] = rotations[idx]
+            new_scales[i*2+1] = scales[idx] * 0.5
+        
+        # 移除原始大高斯 (创建保留掩码)
+        keep_mask = torch.ones(len(positions), dtype=torch.bool, device=self.device)
+        keep_mask[split_indices] = False
+        
+        # 更新高斯参数 - 组合保留的原始高斯和新创建的高斯
+        self.gaussian_params['positions'] = torch.nn.Parameter(
+            torch.cat([positions[keep_mask], new_positions], dim=0)
+        )
+        self.gaussian_params['colors'] = torch.nn.Parameter(
+            torch.cat([colors[keep_mask], new_colors], dim=0)
+        )
+        self.gaussian_params['opacities'] = torch.nn.Parameter(
+            torch.cat([opacities[keep_mask], new_opacities], dim=0)
+        )
+        self.gaussian_params['rotations'] = torch.nn.Parameter(
+            torch.cat([rotations[keep_mask], new_rotations], dim=0)
+        )
+        self.gaussian_params['scales'] = torch.nn.Parameter(
+            torch.cat([scales[keep_mask], new_scales], dim=0)
+        )
+        
+        # 更新radii (使用简化的按比例缩放)
+        radii = self.gaussians['radii'].clone()
+        new_radii = torch.zeros(num_splits * 2, device=self.device)
+        for i, idx in enumerate(split_indices):
+            new_radii[i*2] = radii[idx] * 0.5
+            new_radii[i*2+1] = radii[idx] * 0.5
+        
+        self.gaussians = {
+            'radii': torch.cat([radii[keep_mask], new_radii], dim=0),
+            **self.gaussian_params
+        }
+        
+        print(f"分割后的高斯数量: {len(self.gaussian_params['positions'])}")
 
 
 def main():
