@@ -1011,7 +1011,6 @@ def main():
     # 显示3D高斯球和渲染对比
     gs_model.visualize_3d()
     gs_model.visualize_comparison(original_image, rendered)
-    plt.show()
     
     # 保存结果（可选）
     cv2.imwrite("final_result.png", (rendered*255).astype(np.uint8))
@@ -1024,6 +1023,9 @@ def main():
     model_path = "./saved_models/gaussian_model_lena.pt"
     os.makedirs(os.path.dirname(model_path), exist_ok=True)  # 确保目录存在
     gs_model.save_model(model_path)
+
+    # 可视化结果
+    plt.show()
 
 
 def load_and_render():
